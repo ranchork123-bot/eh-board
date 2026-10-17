@@ -1,0 +1,24 @@
+name: EH Board
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '*/15 * * * *'
+permissions:
+  contents: write
+jobs:
+  board:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render board
+        env:
+          WORKER: https://hubtique-intake.ranchork123.workers.dev
+          RAIL_KEY: ${{ secrets.RAIL_KEY }}
+        run: python3 render.py
+      - name: Commit board
+        run: |
+          git config user.name 'eh-board-bot'
+          git config user.email 'eh-board-bot@users.noreply.github.com'
+          git add index.html
+          git commit -m "board refresh $(date -u +'%H:%M UTC')" || echo "no change"
+          git push
