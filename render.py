@@ -4,7 +4,7 @@ W = os.environ['WORKER'].rstrip('/')
 K = os.environ['RAIL_KEY']
 
 def get(path):
-    r = urllib.request.Request(W + path, headers={'x-rail-key': K})
+    r = urllib.request.Request(W + path, headers={'x-rail-key': K, 'User-Agent': 'curl/8.5.0'})
     with urllib.request.urlopen(r, timeout=20) as f:
         return json.load(f)
 
