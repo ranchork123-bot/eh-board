@@ -97,6 +97,9 @@ def publish(target, media_url, caption):
     raise RuntimeError(f"unknown target {target}")
 
 def main():
+    if not os.environ.get("SA_JSON") or not os.environ.get("META_TOKEN"):
+        print("secrets not configured yet (Brain to set META_TOKEN + SA_JSON); skipping")
+        return 0
     sheets.tok = sa_token()
     claimed = 0
     for tab in TABS:
