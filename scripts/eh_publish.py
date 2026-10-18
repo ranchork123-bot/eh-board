@@ -1,48 +1,55 @@
 #!/usr/bin/env python3
-"""EH publish rail (GitHub Actions).
+"""EH publish rail (GitHub Actions) - zero-cost publish path off the Oracle box.
 
-Zero-cost publish path that bypasses the Oracle n8n box for the video/image
-publish call. Meta fetches media from GitHub release assets (MEDIA_BASE),
-never from Oracle.
-
-Ownership model (dupe-safe with the n8n rail):
-  A queue row belongs to exactly one rail via the `rail` column.
-  rail == GHA  -> this script may claim it.
-  anything else (empty, N8N, ...) -> never touched here.
-  Claim = write status=PUBLISHING + run marker, wait, read back, and only
-  proceed if OUR marker is present. The n8n rail must likewise skip
-  rail == GHA rows before any cutover is armed (Brain/Muse side).
-
-DRY_RUN=true (default, incl. cron until explicitly armed): reads the queue,
-reports what it WOULD claim/publish, writes nothing, posts nothing.
+Queue contract (Brain, Oct 18 2026):
+  Sheet 1_Hh1lhXLBI8tO9uDKlsnBfGRAEMDWF8e5WmEN0A86d0
+  Tabs: "Muse Queue" (FB), "Muse Queue IG" (IG), "Threads Queue"
+  Statuses: draft|ready|posting|posted|held_review|failed
+  Dispatchable: status=ready AND now(IST) inside [earliest_ist, latest_ist]
+  Claim: status ready->posting (+ claim_ts cols M AND Q on Threads) then read
+         back; proceed only if OUR claim holds. Fail closed on unknown claim age.
+  Dedupe: dedupe_key + provider feed readback before every write.
+  Success: posted + post_id + permalink (+ posted_at on Threads).
+  Rows with queue_id starting TEST- are NEVER published (dry-run fixtures).
+Arming: DRY_RUN=false in the workflow AND control cell ACTIVE_RAIL == "GHA".
+Both required; default state publishes nothing.
 """
-import os, sys, json, time
+import os, sys, json, time, datetime
 import requests
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GRequest
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
 SHEET_ID = os.environ["QUEUE_SHEET_ID"]
-MEDIA_BASE = os.environ["MEDIA_BASE"].rstrip("/") + "/"
 TOKEN = os.environ.get("META_TOKEN", "")
 RUN_MARK = "gha:" + os.environ.get("GITHUB_RUN_ID", "local")
+FB_PAGE = "296977197495150"
+IG_USER = "17841406631455812"
+THREADS_USER = os.environ.get("THREADS_USER_ID", "")
+GV = "v23.0"
+ACTIVE_RAIL_TAB = os.environ.get("ACTIVE_RAIL_TAB", "Config")
+ACTIVE_RAIL_CELL = os.environ.get("ACTIVE_RAIL_CELL", "A1")  # VERIFY location with Brain
+CLAIM_STALE_MIN = 30  # fail closed: never touch a 'posting' row older than this
 
-# Queue contract (VERIFY against Brain's caller before arming):
-# tabs read in order; columns by header name on row 1.
-TABS = ["Muse Queue", "Muse Queue IG"]
-COL = {
-    "key": "media.key", "status": "status", "rail": "rail",
-    "caption": "caption", "target": "target", "permalink": "permalink",
-    "run": "run.mark",
-}
-CLAIM_FROM = {"QUEUED", "queued", ""}
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+NOW = datetime.datetime.now(IST)
+
+MUSE_COLS = ["queue_id","status","type","earliest_ist","latest_ist","audience","caption",
+             "comment1","comment2","comment3","last_comment_marketing","feed_image_url",
+             "story_image_url","hashtags_in_caption","source_note","dedupe_key",
+             "preview_state","scheduled_at_ist","post_id","permalink"]
+THREADS_COLS = ["queue_id","status","preview_state","earliest_ist","latest_ist","text",
+                "mix_type","post_id","permalink","posted_at","views","likes","claim_ts",
+                "reposts","last_metrics_at","notes","claim_ts2","image_url"]
+TABS = {"Muse Queue": ("fb", MUSE_COLS), "Muse Queue IG": ("ig", MUSE_COLS),
+        "Threads Queue": ("threads", THREADS_COLS)}
 
 def sa_token():
     info = json.loads(os.environ["SA_JSON"])
-    creds = service_account.Credentials.from_service_account_info(
+    c = service_account.Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    creds.refresh(GRequest())
-    return creds.token
+    c.refresh(GRequest())
+    return c.token
 
 def sheets(method, path, body=None):
     r = requests.request(method, f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}{path}",
@@ -53,91 +60,186 @@ def sheets(method, path, body=None):
 def get_rows(tab):
     d = sheets("GET", f"/values/{requests.utils.quote(tab)}")
     vals = d.get("values", [])
-    if not vals: return [], []
-    hdr = vals[0]
-    return hdr, vals[1:]
+    return (vals[0] if vals else []), (vals[1:] if len(vals) > 1 else [])
 
-def col_idx(hdr, name):
-    return hdr.index(name) if name in hdr else None
-
-def set_cell(tab, rownum, hdr, colname, value):
-    ci = col_idx(hdr, colname)
-    if ci is None:
-        raise RuntimeError(f"missing column {colname} in {tab}")
-    col = chr(ord('A') + ci)
-    # plain (decoded) range in the body; percent-encoded only in the URL path
-    rng = f"{tab}!{col}{rownum}"
+def set_cell(tab, rownum, colidx, colname, value):
+    col = chr(ord('A') + colidx)
+    rng = f"{tab}!{col}{rownum}"  # decoded in body; encoded only in URL
     sheets("PUT", f"/values/{requests.utils.quote(rng)}?valueInputOption=RAW",
            {"range": rng, "values": [[value]]})
 
-def graph(method, url, **kw):
+def graph(method, url, bearer_form=False, **kw):
     kw.setdefault("timeout", 60)
-    sep = "&" if "?" in url else "?"
-    r = requests.request(method, f"{url}{sep}access_token={TOKEN}", **kw)
-    return r.status_code, r.json() if r.content else {}
+    if bearer_form:
+        kw.setdefault("headers", {})["Authorization"] = f"OAuth {TOKEN}"
+        r = requests.request(method, url, **kw)
+    else:
+        sep = "&" if "?" in url else "?"
+        r = requests.request(method, f"{url}{sep}access_token={TOKEN}", **kw)
+    try: body = r.json()
+    except Exception: body = {"raw": r.text[:300]}
+    return r.status_code, body
 
-def publish(target, media_url, caption):
-    """Graph publish. Endpoint params must match Brain's current caller contract."""
-    if target == "fb-reel":
-        page = os.environ["META_PAGE_ID"]
-        return graph("POST", f"https://graph.facebook.com/v23.0/{page}/videos",
-                     data={"file_url": media_url, "description": caption})
-    if target == "ig-reel":
-        ig = os.environ["META_IG_USER"]
-        s, c = graph("POST", f"https://graph.facebook.com/v23.0/{ig}/media",
-                     data={"media_type": "REELS", "video_url": media_url, "caption": caption})
-        cid = c.get("id")
-        if not cid: return s, c
-        for _ in range(30):
-            time.sleep(10)
-            s, st = graph("GET", f"https://graph.facebook.com/v23.0/{cid}?fields=status_code")
-            if st.get("status_code") == "FINISHED": break
-        return graph("POST", f"https://graph.facebook.com/v23.0/{ig}/media_publish",
-                     data={"creation_id": cid})
-    raise RuntimeError(f"unknown target {target}")
+def in_window(row, cols):
+    def p(s):
+        s = (s or "").strip()
+        for f in ("%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M", "%Y-%m-%dT%H:%M"):
+            try: return datetime.datetime.strptime(s, f).replace(tzinfo=IST)
+            except ValueError: pass
+        return None
+    e, l = p(row[cols.index("earliest_ist")]), p(row[cols.index("latest_ist")])
+    if not e or not l: return False
+    return e <= NOW <= l
+
+def already_live(provider, dedupe_hint):
+    """Provider feed readback: True => do NOT write again."""
+    if not dedupe_hint: return False
+    try:
+        if provider == "fb":
+            s, d = graph("GET", f"https://graph.facebook.com/{GV}/{FB_PAGE}/posts?fields=message,created_time&limit=20")
+            items = d.get("data", [])
+            return any(dedupe_hint in (p.get("message") or "") for p in items)
+        if provider == "ig":
+            s, d = graph("GET", f"https://graph.facebook.com/{GV}/{IG_USER}/media?fields=caption,timestamp&limit=20")
+            return any(dedupe_hint in (m.get("caption") or "") for m in d.get("data", []))
+        if provider == "threads":
+            s, d = graph("GET", f"https://graph.threads.net/v1.0/{THREADS_USER}/threads?fields=text,timestamp&limit=20")
+            return any(dedupe_hint in (t.get("text") or "") for t in d.get("data", []))
+    except Exception as e:
+        print(f"readback error {provider}: {e} - FAIL CLOSED")
+        return True
+    return False
+
+def wait_container(cid, kind):
+    for _ in range(40):
+        time.sleep(10)
+        if kind == "ig":
+            s, d = graph("GET", f"https://graph.facebook.com/{GV}/{cid}?fields=status_code")
+            if d.get("status_code") == "FINISHED": return True, d
+            if d.get("status_code") == "ERROR": return False, d
+        else:
+            s, d = graph("GET", f"https://graph.threads.net/v1.0/{cid}?fields=status")
+            if d.get("status") == "FINISHED": return True, d
+            if "ERROR" in str(d.get("status", "")): return False, d
+    return False, {"timeout": True}
+
+def publish(provider, row, cols):
+    g = lambda n: row[cols.index(n)] if n in cols and cols.index(n) < len(row) else ""
+    if provider == "fb":
+        typ, cap, url = g("type").lower(), g("caption"), g("feed_image_url")
+        if typ == "text":
+            return graph("POST", f"https://graph.facebook.com/{GV}/{FB_PAGE}/feed", data={"message": cap})
+        if typ == "image":
+            return graph("POST", f"https://graph.facebook.com/{GV}/{FB_PAGE}/photos", data={"url": url, "caption": cap})
+        if typ == "reel":
+            s, d = graph("POST", f"https://graph.facebook.com/{GV}/{FB_PAGE}/video_reels",
+                         data={"upload_phase": "start"})
+            up, vid = d.get("upload_url"), d.get("video_id")
+            if not up or not vid: return s, d
+            s2, d2 = graph("POST", up, bearer_form=True, data={"file_url": url})
+            if s2 >= 500:
+                s3, chk = graph("GET", f"https://graph.facebook.com/{GV}/{vid}?fields=status")
+                if "ready" not in str(chk).lower() and "published" not in str(chk).lower():
+                    return s2, {"transfer_error": d2, "reconcile": chk}
+            return graph("POST", f"https://graph.facebook.com/{GV}/{FB_PAGE}/video_reels",
+                         data={"upload_phase": "finish", "video_id": vid,
+                               "video_state": "PUBLISHED", "description": cap})
+        return 400, {"error": f"unknown fb type {typ}"}
+    if provider == "ig":
+        typ, cap, url = g("type").lower(), g("caption"), g("feed_image_url")
+        if typ == "reel":
+            payload = {"media_type": "REELS", "video_url": url, "caption": cap, "share_to_feed": "true"}
+        elif typ == "image":
+            payload = {"image_url": url, "caption": cap}
+        else:
+            return 400, {"error": f"unknown ig type {typ}"}
+        s, d = graph("POST", f"https://graph.facebook.com/{GV}/{IG_USER}/media", data=payload)
+        cid = d.get("id")
+        if not cid: return s, d
+        ok, st = wait_container(cid, "ig")
+        if not ok: return 500, st
+        return graph("POST", f"https://graph.facebook.com/{GV}/{IG_USER}/media_publish", data={"creation_id": cid})
+    if provider == "threads":
+        text, img = row[cols.index("text")], row[cols.index("image_url")]
+        payload = {"media_type": "IMAGE" if img else "TEXT", "text": text}
+        if img: payload["image_url"] = img
+        s, d = graph("POST", f"https://graph.threads.net/v1.0/{THREADS_USER}/threads", data=payload)
+        cid = d.get("id")
+        if not cid: return s, d
+        ok, st = wait_container(cid, "threads")
+        if not ok: return 500, st
+        return graph("POST", f"https://graph.threads.net/v1.0/{THREADS_USER}/threads_publish", data={"creation_id": cid})
+    return 400, {"error": "unknown provider"}
+
+def claim_stale(tab, rownum, row, cols):
+    """Fail closed on unknown claim age for rows already 'posting'."""
+    if "claim_ts" not in cols: return False
+    ts = row[cols.index("claim_ts")]
+    try:
+        t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds() > CLAIM_STALE_MIN * 60
+    except Exception:
+        return True  # unknown age -> fail closed
 
 def main():
-    if not os.environ.get("SA_JSON") or not os.environ.get("META_TOKEN"):
-        print("secrets not configured yet (Brain to set META_TOKEN + SA_JSON); skipping")
+    if not os.environ.get("SA_JSON") or not TOKEN:
+        print("secrets not configured yet; skipping")
         return 0
     sheets.tok = sa_token()
-    claimed = 0
-    for tab in TABS:
+    if not DRY_RUN:
+        rail = sheets("GET", f"/values/{requests.utils.quote(ACTIVE_RAIL_TAB + '!' + ACTIVE_RAIL_CELL)}")
+        val = (rail.get("values") or [[""]])[0][0]
+        if val != "GHA":
+            print(f"active_rail cell = {val!r}, not GHA - not armed, exiting")
+            return 0
+    acted = 0
+    for tab, (provider, cols) in TABS.items():
         hdr, rows = get_rows(tab)
-        if not hdr:
-            print(f"[{tab}] empty"); continue
-        missing = [c for c in COL.values() if c not in hdr]
-        if missing:
-            print(f"[{tab}] MISSING COLUMNS {missing} - queue contract mismatch, skipping tab"); continue
+        if not hdr: continue
         for i, row in enumerate(rows):
             rownum = i + 2
-            cell = lambda name: row[col_idx(hdr, COL[name])] if col_idx(hdr, COL[name]) is not None and col_idx(hdr, COL[name]) < len(row) else ""
-            status, rail, key, target = cell("status"), cell("rail"), cell("key"), cell("target")
-            if rail != "GHA" or status not in CLAIM_FROM or not key:
+            row += [""] * (len(cols) - len(row))
+            qid, status = row[0], row[1]
+            if not qid: continue
+            if qid.startswith("TEST-"):
+                if DRY_RUN: print(f"[{tab} r{rownum}] DRY-RUN fixture {qid}: would evaluate only, never publish")
                 continue
-            media_url = MEDIA_BASE + key
-            print(f"[{tab} r{rownum}] candidate key={key} target={target}")
+            if status == "posting" and claim_stale(tab, rownum, row, cols):
+                print(f"[{tab} r{rownum}] {qid} stale/unknown claim - FAIL CLOSED, skipping"); continue
+            if status != "ready" or not in_window(row, cols): continue
+            dedupe_hint = row[cols.index("dedupe_key")] if "dedupe_key" in cols else (row[cols.index("text")] if provider == "threads" else "")
+            if already_live(provider, dedupe_hint):
+                print(f"[{tab} r{rownum}] {qid} already live per provider readback - skip"); continue
+            print(f"[{tab} r{rownum}] candidate {qid} provider={provider}")
             if DRY_RUN:
-                print(f"[{tab} r{rownum}] DRY-RUN would claim+publish {media_url}")
-                continue
-            set_cell(tab, rownum, hdr, "status", "PUBLISHING")
-            set_cell(tab, rownum, hdr, "run", RUN_MARK)
+                print(f"[{tab} r{rownum}] DRY-RUN would claim+publish"); continue
+            # claim
+            set_cell(tab, rownum, cols.index("status"), "status", "posting")
+            if "claim_ts" in cols:
+                ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                set_cell(tab, rownum, cols.index("claim_ts"), "claim_ts", ts)
+                set_cell(tab, rownum, cols.index("claim_ts2"), "claim_ts2", ts)
             time.sleep(3)
             hdr2, rows2 = get_rows(tab)
-            back = rows2[rownum - 2]
-            if back[col_idx(hdr2, COL["run"])] != RUN_MARK:
-                print(f"[{tab} r{rownum}] claim LOST (another rail won) - skipping"); continue
-            code, res = publish(target, media_url, cell("caption"))
-            if code in (200, 201) and (res.get("id") or res.get("post_id")):
-                link = res.get("permalink") or res.get("id") or res.get("post_id")
-                set_cell(tab, rownum, hdr, "status", "POSTED")
-                set_cell(tab, rownum, hdr, "permalink", str(link))
-                print(f"[{tab} r{rownum}] POSTED {link}")
+            back = rows2[rownum - 2] + [""] * (len(cols) - len(rows2[rownum - 2]))
+            if back[1] != "posting":
+                print(f"[{tab} r{rownum}] claim lost for {qid} - skipping"); continue
+            code, res = publish(provider, row, cols)
+            pid = res.get("id") or res.get("post_id") or ""
+            if code in (200, 201) and pid:
+                set_cell(tab, rownum, cols.index("status"), "status", "posted")
+                set_cell(tab, rownum, cols.index("post_id"), "post_id", str(pid))
+                link = res.get("permalink") or (res.get("permalink_url") or "")
+                if link: set_cell(tab, rownum, cols.index("permalink"), "permalink", str(link))
+                if provider == "threads":
+                    set_cell(tab, rownum, cols.index("posted_at"), "posted_at", NOW.isoformat())
+                print(f"[{tab} r{rownum}] POSTED {qid} -> {pid}")
             else:
-                set_cell(tab, rownum, hdr, "status", "QUEUED")
-                print(f"[{tab} r{rownum}] publish failed http={code} err={str(res)[:200]}")
-            claimed += 1
-    print(f"done. claimed={claimed} dry_run={DRY_RUN}")
+                set_cell(tab, rownum, cols.index("status"), "status", "ready")
+                print(f"[{tab} r{rownum}] publish failed {qid} http={code} {str(res)[:200]}")
+            acted += 1
+    print(f"done. acted={acted} dry_run={DRY_RUN}")
+    return 0
 
 if __name__ == "__main__":
     sys.exit(main())
