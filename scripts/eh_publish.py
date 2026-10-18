@@ -127,11 +127,11 @@ def publish(provider, row, cols):
     g = lambda n: row[cols.index(n)] if n in cols and cols.index(n) < len(row) else ""
     if provider == "fb":
         typ, cap, url = g("type").lower(), g("caption"), g("feed_image_url")
-        if typ == "text":
+        if typ == "text_only":
             return graph("POST", f"https://graph.facebook.com/{GV}/{FB_PAGE}/feed", data={"message": cap})
-        if typ == "image":
+        if typ in ("text_photo", "multi_photo"):
             return graph("POST", f"https://graph.facebook.com/{GV}/{FB_PAGE}/photos", data={"url": url, "caption": cap})
-        if typ == "reel":
+        if typ == "video_reel":
             s, d = graph("POST", f"https://graph.facebook.com/{GV}/{FB_PAGE}/video_reels",
                          data={"upload_phase": "start"})
             up, vid = d.get("upload_url"), d.get("video_id")
@@ -147,9 +147,9 @@ def publish(provider, row, cols):
         return 400, {"error": f"unknown fb type {typ}"}
     if provider == "ig":
         typ, cap, url = g("type").lower(), g("caption"), g("feed_image_url")
-        if typ == "reel":
+        if typ == "video_reel":
             payload = {"media_type": "REELS", "video_url": url, "caption": cap, "share_to_feed": "true"}
-        elif typ == "image":
+        elif typ in ("poster", "carousel"):
             payload = {"image_url": url, "caption": cap}
         else:
             return 400, {"error": f"unknown ig type {typ}"}
@@ -201,8 +201,10 @@ def main():
             row += [""] * (len(cols) - len(row))
             qid, status = row[0], row[1]
             if not qid: continue
-            if qid.startswith("TEST-"):
-                if DRY_RUN: print(f"[{tab} r{rownum}] DRY-RUN fixture {qid}: would evaluate only, never publish")
+            is_test = qid.startswith("TEST-")
+            if not is_test:
+                # No active_rail flag exists yet (Brain, Oct 18): Actions touches ONLY TEST- rows
+                # until a flag cell is created and announced to Brain + Main.
                 continue
             if status == "posting" and claim_stale(tab, rownum, row, cols):
                 print(f"[{tab} r{rownum}] {qid} stale/unknown claim - FAIL CLOSED, skipping"); continue
@@ -212,7 +214,7 @@ def main():
                 print(f"[{tab} r{rownum}] {qid} already live per provider readback - skip"); continue
             print(f"[{tab} r{rownum}] candidate {qid} provider={provider}")
             if DRY_RUN:
-                print(f"[{tab} r{rownum}] DRY-RUN would claim+publish"); continue
+                print(f"[{tab} r{rownum}] DRY-RUN would claim+publish{' (TEST fixture: no publish ever)' if is_test else ''}"); continue
             # claim
             set_cell(tab, rownum, cols.index("status"), "status", "posting")
             if "claim_ts" in cols:
@@ -224,6 +226,10 @@ def main():
             back = rows2[rownum - 2] + [""] * (len(cols) - len(rows2[rownum - 2]))
             if back[1] != "posting":
                 print(f"[{tab} r{rownum}] claim lost for {qid} - skipping"); continue
+            if is_test:
+                print(f"[{tab} r{rownum}] TEST fixture {qid}: claim+readback OK, publish SKIPPED by design")
+                set_cell(tab, rownum, cols.index("status"), "status", "ready")
+                continue
             code, res = publish(provider, row, cols)
             pid = res.get("id") or res.get("post_id") or ""
             if code in (200, 201) and pid:
