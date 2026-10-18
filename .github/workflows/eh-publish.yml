@@ -1,0 +1,34 @@
+name: eh-publish-rail
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (no claims, no posts)"
+        required: true
+        default: "true"
+        type: string
+concurrency:
+  group: eh-publish-rail
+  cancel-in-progress: false
+permissions:
+  contents: none
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+      META_TOKEN: ${{ secrets.META_TOKEN }}
+      SA_JSON: ${{ secrets.SA_JSON }}
+      QUEUE_SHEET_ID: "1_Hh1lhXLBI8tO9uDKlsnBfGRAEMDWF8e5WmEN0A86d0"
+      MEDIA_BASE: "https://github.com/ranchork123-bot/eh-board/releases/download/media/"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet requests google-auth
+      - name: publish pass
+        run: python3 scripts/eh_publish.py
